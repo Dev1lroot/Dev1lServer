@@ -1,6 +1,6 @@
-import os, osproc, json, nre, unicode, strutils, rdstdin, system, terminal, asynchttpserver, asyncdispatch
+import os, osproc, json, times, nre, unicode, strutils, rdstdin, system, terminal, asynchttpserver, asyncdispatch
 
-echo "DEV1LSERVER v1.0"
+echo "DEV1LSERVER v1.1"
 
 type
   KeyVal = tuple[key, val: string]
@@ -22,12 +22,19 @@ proc cb(req: Request) {.async.} =
 
   var default_h = newHttpHeaders([("Content-Type","text/html")])
   var locations: JsonNode
+  var minify, firewall = false
+  var limit, interval = 0
 
   if(existsFile("server.json")):
     var json = readFile("server.json")
     try:
       var settings = parseJson(json)
       locations = settings["locations"]
+      minify = settings["options"]["minifier"].getBool()
+      firewall = settings["options"]["firewall"].getBool()
+      if firewall:
+        limit = settings["firewall"]["limit"].getInt()
+        interval = settings["firewall"]["interval"].getInt()
     except:
       stdout.styledWrite(fgRed, "server.json corrupter or damaged, default settings has been applied" & "\n")
   else:
@@ -92,6 +99,11 @@ proc cb(req: Request) {.async.} =
     else:
       stdout.write "` ...(missing)!\n"
       return "<error>file at `"&i&"` not found</error>"
+
+  proc d1_html_minifier(html: string): string =
+    var newhtml = html
+    newhtml = newhtml.replace(re"[\n\r\t]","")
+    return newhtml
 
   proc d1_setval(html: string): string =
     var newhtml = html
@@ -161,18 +173,18 @@ proc cb(req: Request) {.async.} =
             valueToReturn = value
     return valueToReturn
 
-  proc status(code: int, message: string, headers: HttpHeaders) {.async.} =
+  proc status(code: int, msg: string, headers: HttpHeaders) {.async.} =
     echo "RESPONCE:"
     var scode = $code
     case code:
       of 403:
-        var message = "<h3>403 FORBIDDEN</h3>"
+        var message = "<h3>403 FORBIDDEN</h3><p>"&msg&"</p>"
         await req.respond(Http403, message, newHttpHeaders([("Content-Type","text/html")]))
       of 404:
-        var message = "<h3>404 PAGE NOT FOUND</h3>"
+        var message = "<h3>404 PAGE NOT FOUND</h3><p>"&msg&"</p>"
         await req.respond(Http404, message, newHttpHeaders([("Content-Type","text/html")]))
       else:
-        await req.respond(Http200, message, headers)
+        await req.respond(Http200, msg, headers)
     stdout.styledWrite(fgWhite, "> ")
     stdout.styledWrite(fgBlue, req.hostname)
     stdout.styledWrite(fgWhite, " <- ")
@@ -197,6 +209,42 @@ proc cb(req: Request) {.async.} =
     for i in locations:
       if i["location"].getStr() == location:
         return i
+
+  if firewall:
+    #var unixtime: int = toUnix(getTime())
+    var r = %*{
+      "requests": 1,
+      "lastdate": toUnix(getTime())
+    }
+    if(existsFile("config/modules/firewall/gateway.json")):
+      var json = readFile("config/modules/firewall/gateway.json")
+      try:
+        var clients = parseJson(json)
+        try:
+          var client_requests = clients[req.hostname]["requests"].getInt();
+          var client_lastdate = clients[req.hostname]["lastdate"].getInt();
+          if client_requests >= limit:
+            var timeout = client_lastdate + interval
+            if timeout > toUnix(getTime()):
+              await status(403,"TOO MANY REQUESTS",default_h)
+              echo "[FIREWALL]: TOO MANY REQUESTS FROM THIS USER"
+              echo "[FIREWALL]: NOW: ",toUnix(getTime()),", TIMEOUT: ",timeout
+            else:
+              echo "[FIREWALL]: TIMEOUT PROCEED"
+              echo "[FIREWALL]: NOW: ",toUnix(getTime()),", TIMEOUT: ",timeout
+              clients[req.hostname] = r
+              writeFile("config/modules/firewall/gateway.json",$clients)
+          else:
+            r["requests"] = newJInt(client_requests + 1)
+            clients[req.hostname] = r
+            writeFile("config/modules/firewall/gateway.json",$clients)
+        except:
+          clients.add(req.hostname,r)
+          writeFile("config/modules/firewall/gateway.json",$clients)
+      except:
+        echo "[ERROR]: Check firewall config"
+    else:
+      writeFile("config/modules/firewall/gateway.json","{}")
 
   if (location != ""):
     if(existsFile("www"&location)):
@@ -231,6 +279,8 @@ proc cb(req: Request) {.async.} =
               message = d1_setval(message)
           while(message.contains(re"({)(\s*|)(@include:)(\s*|)[A-Za-z0-9-._]*(\s*|)(})")):
             message = d1_parse(message,location)
+            if minify:
+              message = d1_html_minifier(message)
           await status(200, message, default_h)
         except:
           await status(404,"",default_h)
